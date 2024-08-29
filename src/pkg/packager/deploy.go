@@ -19,11 +19,15 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/avast/retry-go/v4"
-	"github.com/defenseunicorns/pkg/helpers/v2"
+	pkgkubernetes "github.com/defenseunicorns/pkg/kubernetes"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/cli-utils/pkg/kstatus/watcher"
+	"sigs.k8s.io/cli-utils/pkg/object"
 
+	"github.com/defenseunicorns/pkg/helpers/v2"
 	"github.com/zarf-dev/zarf/src/api/v1alpha1"
 	"github.com/zarf-dev/zarf/src/config"
 	"github.com/zarf-dev/zarf/src/internal/git"
@@ -233,6 +237,30 @@ func (p *Packager) deployComponents(ctx context.Context) (deployedComponents []t
 	return deployedComponents, nil
 }
 
+func runHealthChecks(ctx context.Context, watcher watcher.StatusWatcher, healthChecks []v1alpha1.NamespacedObjectKindReference) error {
+	objs := []object.ObjMetadata{}
+	for _, hc := range healthChecks {
+		gv, err := schema.ParseGroupVersion(hc.APIVersion)
+		if err != nil {
+			return err
+		}
+		obj := object.ObjMetadata{
+			GroupKind: schema.GroupKind{
+				Group: gv.Group,
+				Kind:  hc.Kind,
+			},
+			Namespace: hc.Namespace,
+			Name:      hc.Name,
+		}
+		objs = append(objs, obj)
+	}
+	err := pkgkubernetes.WaitForReady(ctx, watcher, objs)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (p *Packager) deployInitComponent(ctx context.Context, component v1alpha1.ZarfComponent) (charts []types.InstalledChart, err error) {
 	hasExternalRegistry := p.cfg.InitOpts.RegistryInfo.Address != ""
 	isSeedRegistry := component.Name == "zarf-seed-registry"
@@ -307,7 +335,7 @@ func (p *Packager) deployComponent(ctx context.Context, component v1alpha1.ZarfC
 		if p.state == nil {
 			err = p.setupState(ctx)
 			if err != nil {
-				return charts, err
+				return nil, err
 			}
 		}
 
@@ -323,28 +351,28 @@ func (p *Packager) deployComponent(ctx context.Context, component v1alpha1.ZarfC
 
 	err = p.populateComponentAndStateTemplates(component.Name)
 	if err != nil {
-		return charts, err
+		return nil, err
 	}
 
 	if err = actions.Run(ctx, onDeploy.Defaults, onDeploy.Before, p.variableConfig); err != nil {
-		return charts, fmt.Errorf("unable to run component before action: %w", err)
+		return nil, fmt.Errorf("unable to run component before action: %w", err)
 	}
 
 	if hasFiles {
 		if err := p.processComponentFiles(component, componentPath.Files); err != nil {
-			return charts, fmt.Errorf("unable to process the component files: %w", err)
+			return nil, fmt.Errorf("unable to process the component files: %w", err)
 		}
 	}
 
 	if hasImages {
 		if err := p.pushImagesToRegistry(ctx, component.Images, noImgChecksum); err != nil {
-			return charts, fmt.Errorf("unable to push images to the registry: %w", err)
+			return nil, fmt.Errorf("unable to push images to the registry: %w", err)
 		}
 	}
 
 	if hasRepos {
 		if err = p.pushReposToRepository(ctx, componentPath.Repos, component.Repos); err != nil {
-			return charts, fmt.Errorf("unable to push the repos to the repository: %w", err)
+			return nil, fmt.Errorf("unable to push the repos to the repository: %w", err)
 		}
 	}
 
@@ -357,12 +385,23 @@ func (p *Packager) deployComponent(ctx context.Context, component v1alpha1.ZarfC
 
 	if hasCharts || hasManifests {
 		if charts, err = p.installChartAndManifests(ctx, componentPath, component); err != nil {
-			return charts, err
+			return nil, err
 		}
 	}
 
 	if err = actions.Run(ctx, onDeploy.Defaults, onDeploy.After, p.variableConfig); err != nil {
-		return charts, fmt.Errorf("unable to run component after action: %w", err)
+		return nil, fmt.Errorf("unable to run component after action: %w", err)
+	}
+
+	if len(component.HealthChecks) > 0 {
+		healthCheckContext, cancel := context.WithTimeout(ctx, p.cfg.DeployOpts.Timeout)
+		defer cancel()
+		spinner := message.NewProgressSpinner("Running Health checks for %s", component.Name)
+		defer spinner.Stop()
+		if err = runHealthChecks(healthCheckContext, p.cluster.Watcher, component.HealthChecks); err != nil {
+			return nil, fmt.Errorf("health checks failed: %w", err)
+		}
+		spinner.Success()
 	}
 
 	err = g.Wait()
