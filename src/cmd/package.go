@@ -90,11 +90,23 @@ var packageDeployCmd = &cobra.Command{
 		}
 		defer pkgClient.ClearTempPaths()
 
-		ctx := cmd.Context()
-
-		if err := pkgClient.Deploy(ctx); err != nil {
+		deployedComponents, err := pkgClient.Deploy(cmd.Context())
+		if err != nil {
 			return fmt.Errorf("failed to deploy package: %w", err)
 		}
+
+		// Don't print if cluster is not configured
+		cluster := pkgClient.GetCluster()
+		if cluster == nil {
+			return nil
+		}
+		// Grab a fresh copy of the state to print the most up-to-date version of the creds
+		latestState, err := cluster.LoadZarfState(cmd.Context())
+		if err != nil {
+			return err
+		}
+		common.PrintCredentialTable(latestState, deployedComponents)
+
 		return nil
 	},
 }

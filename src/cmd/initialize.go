@@ -69,10 +69,21 @@ var initCmd = &cobra.Command{
 		}
 		defer pkgClient.ClearTempPaths()
 
-		err = pkgClient.Deploy(cmd.Context())
+		deployedComponents, err := pkgClient.Deploy(cmd.Context())
 		if err != nil {
 			return err
 		}
+
+		connectStrings := types.ConnectStrings{}
+		for _, comp := range deployedComponents {
+			for _, chart := range comp.InstalledCharts {
+				for k, v := range chart.ConnectStrings {
+					connectStrings[k] = v
+				}
+			}
+		}
+		common.PrintConnectStringTable(connectStrings)
+
 		return nil
 	},
 }
